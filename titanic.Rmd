@@ -1,0 +1,380 @@
+---
+title: "Logistic Regression - Titanic"
+output: 
+        html_document:
+                toc: true
+                toc_depth: 2
+                toc_float: true
+                number_sections: true
+date: "`r Sys.Date()`"
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Settings 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(ggplot2)
+library(lattice)
+library(doParallel)
+tr_set <- read.csv(file = "data/train.csv")
+test_set <- read.csv(file = "data/test.csv")
+gender_subm <- read.csv(file = "data/gender_submission.csv")
+# sibsp 	# of siblings / spouses aboard the Titanic 	
+# parch 	# of parents / children aboard the Titanic
+
+```
+
+
+# Review Imported Data Sets
+
+```{r}
+str(tr_set)
+```
+
+```{r}
+str(test_set)
+```
+
+```{r}
+str(gender_subm)
+```
+
+
+
+```{r feature engineering}
+df <- tr_set
+# Remove Predictors which seem obviously irrelevant for the statistical analysis.
+df <- df[, !names(df) %in% c("PassengerId", "Name", "Ticket", "Cabin", "Embarked")]
+df$Survived <- factor(x = df$Survived, levels = c(0, 1), labels = c("0", "1"))
+df$Sex <- factor(x = df$Sex, levels = c("female", "male"), labels = c("female", "male"))
+str(df)
+```
+
+
+```{r}
+head(df)
+```
+
+
+```{r}
+dim(df)
+```
+
+
+```{r}
+summary(df)
+```
+
+
+# Clean Data
+
+## NAs
+
+Remove Predictors with too many NAs (missing data)
+
+```{r echo=TRUE}
+df <- df[, colMeans(is.na(df)) < .9]
+dim(df)
+```
+
+```{r}
+df <- df[!is.na(df$Age),]
+tr_set <- tr_set[!is.na(tr_set$Age),]
+test_set <- test_set[!is.na(test_set$Age),]
+test_set[is.na(test_set$Age),]
+```
+
+
+## Near Zero Variance Predictors
+
+The identified near zero variance predictors are the following:
+
+```{r}
+# create a zero variance variable for demonstration purposes
+df$one <- 1
+near_zero_vars <- nearZeroVar(df)
+df[, near_zero_vars]
+```
+
+
+After the exclusion of near-zero-variance predictors the data set looks as follows:
+
+```{r}
+if (length(near_zero_vars) > 0) {
+        df <- df[, -c(near_zero_vars)]
+}
+remove(near_zero_vars)
+head(df)
+```
+
+
+## Reduce Collinearity
+
+**Collinearity** is the situation where a pair of predictor variables have a substantial correlation with each other. In general, there are good reasons to avoid data with highly correlated predictors as it can result in **highly unstable models** and **degraded predictive performance**.
+
+
+### Plot Correlations
+
+The darker areas in the correlation plot show variables which are correlated with each other.
+```{r echo=TRUE}
+# filter on numeric variables (exclude outcome, not a predictor)
+predictors <- df[, !names(df) %in% c("Survived")]
+# select non_numeric predictors, to be added back later
+predictors_non_numeric <- predictors[, !sapply(predictors, is.numeric), drop = FALSE]
+predictors_numeric <- predictors[,sapply(predictors, is.numeric)]
+correlations <- cor(predictors_numeric, use = "complete.obs")
+corrplot::corrplot(correlations, order = "hclust",tl.cex = 0.5)
+```
+
+
+### Filter pairwise correlations
+
+Removing following predictors:
+
+```{r}
+highCorr <- findCorrelation(correlations, cutoff = 0.75)
+remove(correlations)
+head(predictors_numeric[highCorr])
+```
+
+
+### Remaining predictors
+
+```{r}
+if (length(highCorr) > 0) {
+        predictors_numeric <- predictors_numeric[, -highCorr]
+}
+remove(highCorr)
+names(predictors_numeric)
+```
+
+
+### Dataset after removal of predictors
+
+```{r}
+df <- cbind(subset(df, select = "Survived", drop = FALSE),
+            predictors_non_numeric,
+            predictors_numeric)
+
+remove(predictors_non_numeric)
+head(df)
+```
+
+
+Dimension of dataset after removal of highly correlated predictors:
+
+```{r echo=TRUE}
+dim(df)
+```
+
+
+Review correlation plot again after removal of correlated predictors (reduced collinearity):
+
+```{r echo=TRUE}
+correlations <- cor(predictors_numeric, use = "complete.obs")
+corrplot::corrplot(correlations, order = "hclust",tl.cex = 0.5)
+remove(correlations)
+remove(predictors)
+remove(predictors_numeric)
+```
+
+The darker areas should be reduced as a result of having removed correlated predictors.
+
+
+# EDA
+
+## Histogram
+
+#### Base R
+
+```{r}
+hist(x = as.numeric(df[df$Survived == T & df$Sex == "male", "Age"]),
+     col = "green",
+  xlab = "Age",
+  main = "Survived - Male vs Female",
+  ylim = range(0:50)
+)
+hist(x = as.numeric(df[df$Survived == T & df$Sex == "female", "Age"]),
+     col = alpha("red", 0.2),
+     add = TRUE
+)
+```
+
+
+#### lattice
+
+```{r}
+df_lattice <- df
+lattice::histogram(Survived~Age | Pclass, 
+                   data = df_lattice[df_lattice$Survived == TRUE,], 
+                   layout = c(3,1),
+                   type="count",
+                   endpoints=c(0,100),
+                   col="transparent",xlab = "Age",
+                   main = "Survived by Age and Pclass")
+```
+
+
+
+## Box Plot
+
+### Base R
+
+```{r}
+boxplot(Fare ~ Survived,
+        data = df,
+  ylab = "Fare",
+  main = "Fare ~ Survived"
+)
+```
+
+
+### ggplot
+
+```{r}
+ggplot(df) +
+  aes(x = Survived, y = Fare) +
+  geom_boxplot(fill = "#0c4c8a") +
+  theme_minimal()
+```
+
+
+### lattice
+
+```{r}
+bwplot(Survived ~ Fare | Sex, df_lattice)
+```
+
+## Scatter Plot
+
+```{r}
+df_pairs <- df
+df_pairs$Survived <- as.factor(df$Survived)
+pairs(df_pairs,
+      main = "Titanic - pairs(df)",
+      pch = 21,
+      cex = 2,
+      bg = c("red", "green3")[unclass(df_pairs$Survived)])
+```
+
+
+```{r}
+lattice::splom(df_lattice,
+               groups = df_lattice$Survived)
+```
+
+#### ggpairs()
+
+```{r}
+library(GGally)
+ggpairs(data = df_pairs, progress = FALSE, ggplot2::aes(colour=Survived))
+```
+
+```{r remov unneeded dataframes}
+remove(df_pairs)
+remove(df_lattice)
+```
+
+
+***
+# Machine Learning 
+
+Alternatives to try:
+
+- Logistic Regression (Base R)
+- Logistic Regression (Caret)
+- Support Vector Machine
+- Boosted Trees
+- Random Forest
+
+
+## Logistic Regression Base R
+
+Start with all variables and exclude irrelevant ones.
+
+```{r}
+glm_df <- glm(Survived ~ ., data = df[, -c(6,7)], family = binomial)
+summary(glm_df)
+```
+
+
+Confusion Matrix:
+
+```{r}
+df$glm_base <- predict(object = glm_df, newdata = df, type = "response")
+conf_matrix <- confusionMatrix(as.factor(ifelse(df$glm_base < 0.5, FALSE, TRUE)), as.factor(df$Survived))
+conf_matrix
+```
+
+
+## Logistic Regression (Caret) 
+
+```{r}
+df_caret <- df[, -8]
+df_caret$Survived <- as.factor(df_caret$Survived)
+
+glm_model_caret <- caret::train(
+        Survived ~ .,
+        data = df_caret,
+        preProc = c("BoxCox", "center", "scale"),
+        method = "glm"
+)
+
+glm_model_caret
+```
+
+
+## Random Forest
+
+```{r}
+cl <- makePSOCKcluster(5)
+registerDoParallel(cl)
+# train model
+rf_model <- caret::train(Survived ~ .,
+                          data = df_caret,
+                          # preProc = c("BoxCox", "center", "scale"),
+                          method = "rf")
+stopCluster(cl)
+# print results
+rf_model
+```
+```{r}
+plot(rf_model)
+```
+
+```{r}
+caret::varImp(rf_model)
+```
+
+
+## Support Vector Machine
+
+```{r}
+# library(kernlab)
+# df_svm <- df_caret
+# df_svm$Survived <- unclass(df$Survived)
+# df_svm$Sex <- as.numeric(unclass(df_svm$Sex))
+# set.seed(202)
+# sigmaRangeReduced <- kernlab::sigest(as.matrix(df_svm))
+# svmRGridReduced <- expand.grid(.sigma = sigmaRangeReduced[1], 
+#                                .C = 2^(seq(-4,4)))
+# df_svm$Survived <- ifelse(df_svm$Survived == T, "survived", "perished")
+# cl <- makePSOCKcluster(5)
+# registerDoParallel(cl)
+# svmRModel <- train(df_svm[,-1],
+#                    as.factor(df_svm$Survived),
+#                    method = "svmRadial",
+#                    metric = "ROC",
+#                    preProc = c("center", "scale"),
+#                    tuneGrid = svmRGridReduced,
+#                    classProbs = TRUE,
+#                    trControl = trainControl(classProbs = TRUE),
+#                    fit = FALSE)
+# stopCluster(cl)
+```
+
+
+
