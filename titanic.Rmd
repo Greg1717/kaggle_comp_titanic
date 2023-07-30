@@ -8,12 +8,12 @@ output:
                 number_sections: true
 date: "`r Sys.Date()`"
 editor_options: 
-  chunk_output_type: inline
+  chunk_output_type: console
 ---
 
-# Settings 
 
-```{r setup, include=FALSE}
+# Settings & Packages
+```{r settings}
 knitr::opts_chunk$set(echo = TRUE)
 library(data.table)
 library(caret)
@@ -21,37 +21,96 @@ library(ggplot2)
 library(lattice)
 library(doParallel)
 library(kernlab)
+```
+
+```{r import csv, include=FALSE}
 ds_train <- read.csv(file = "data/train.csv")
 ds_test <- read.csv(file = "data/test.csv")
 subm_template <- read.csv(file = "data/gender_submission.csv")
+head(ds_train)
+head(ds_test)
+head(subm_template)
+
 # create full dataset
 ds_test$Survived <- NA
 ds_train$train <- T
 ds_test$train <- F
 ds_full <- rbind(ds_train, ds_test)
+remove(ds_train)
+remove(ds_test)
 ds_full <- as.data.table(ds_full)
-ds_full
-# Embarked
+
+# Embarked; fill in where empty or is.na()
 ds_full[, table(Embarked, useNA = "always")]
 ds_full[Embarked == "", Embarked := "S"]
 ds_full[, table(Embarked, useNA = "always")]
-# family size
+
+# create family size
 ds_full[, family := SibSp + Parch + 1]
-# identify adult vs child based on name
-ds_full[, ad_ch := fcase(Name %like% "(Mr.|Mrs.|Dr\\.|Col\\.|Rev\\.|Mme\\.|Ms.)", "adult",
-                         Name %like% "(Master)" & Parch > 0, "child",
-                         Name %like% "Miss\\." & Parch > 0, "child",
+```
+
+
+# Analyze names to determine if adult or child 
+```{r}
+# Grab title from passenger names
+ds_full$Title <- gsub('(.*, )|(\\..*)', '', ds_full$Name)
+
+# Show title counts by sex
+table(ds_full$Sex, ds_full$Title)
+
+# Identify adult vs child based on name
+ds_full[, ad_ch := fcase(Name %like% "(Mr\\.|Mrs\\.|Dr\\.|Col\\.|Rev\\.|Mme\\.|Ms\\.|Capt\\.|Don\\.|Dona\\.|Lady|Major|Sir)", "adult",
+                         Name %like% "(Master|Miss\\.|Mlle\\.)" & Parch > 0, "child",
                          family == 1, "adult",
                          Parch == 0, "adult",
                          Parch == 1 & SibSp == 1, "adult",
                          default = NA)]
-ds_full[ad_ch == "adult"]
-ds_full[ad_ch == "child"]
-# Fare
+ds_full[is.na(ad_ch)]
+```
+
+
+
+# Do families sink or swim together?
+
+Now that we've taken care of splitting passenger name into some new variables, we can take it a step further and make some new family variables. First we're going to make a **family size** variable based on number of siblings/spouse(s) (maybe someone has more than one spouse?) and number of children/parents. 
+
+What does our family size variable look like? To help us understand how it may relate to survival, let's plot it among the training data.
+
+```{r, message=FALSE, warning=FALSE}
+# Use ggplot2 to visualize the relationship between family size & survival
+ggplot(ds_full[1:891,], aes(x = family, fill = factor(Survived))) +
+  geom_bar(stat='count', position='dodge') +
+  scale_x_continuous(breaks=c(1:11)) +
+  labs(x = 'Family Size')
+  # theme_few()
+```
+
+Ah hah. We can see that there's a survival penalty to singletons and those with family sizes above 4. We can collapse this variable into three levels which will be helpful since there are comparatively fewer large families. Let's create a **discretized family size** variable.
+
+```{r}
+# Discretize family size
+ds_full[, family_size_discrete := fcase(family == 1, "single",
+                                        family > 4, "large",
+                                        default = "average")]
+
+# Show family size by survival using a mosaic plot
+mosaicplot(table(ds_full$family_size_discrete, ds_full$Survived, useNA = "no"), main='Family Size by Survival', shade=TRUE)
+
+mosaicplot(table(ds_full$family_size_discrete, ds_full$Survived, useNA = "no"), main='Family Size by Survival')
+```
+
+The mosaic plot shows that we preserve our rule that there's a survival penalty among singletons and large families, but a benefit for passengers in small families. 
+
+
+# Other Variables
+
+```{r}
+# Fare; insert where missing
 ds_full[is.na(Fare)]
 median_Fare_3Pclass <- ds_full[Pclass == 3, median(Fare, na.rm = T)]
 ds_full[is.na(Fare), Fare := median_Fare_3Pclass]
 remove(median_Fare_3Pclass)
+
 # remove irrelevant
 ds_full[, Ticket := NULL]
 ds_full[, Cabin := NULL]
@@ -60,22 +119,27 @@ ds_full[, Name := NULL]
 # impute Age
 median_age_adult <- ds_full[ad_ch == "adult", median(Age, na.rm = T)]
 median_age_child <- ds_full[ad_ch == "child", median(Age, na.rm = T)]
+ds_full[is.na(Age)]
 ds_full[is.na(Age), Age := fcase(ad_ch == "adult", median_age_adult,
                                  ad_ch == "child", median_age_child)]
 remove(median_age_adult)
 remove(median_age_child)
-# factors
+
+# convert to factors
 ds_full$Pclass <- as.factor(ds_full$Pclass)
 ds_full$Sex <- as.factor(ds_full$Sex)
 ds_full$Embarked <- as.factor(ds_full$Embarked)
 ds_full$ad_ch <- as.factor(ds_full$ad_ch)
+
 # check if variable Embarked seems relevant by means of logistic regression
-model_glm <- glm(Survived ~ Sex + Age + Pclass + Embarked, 
-              data = ds_full, 
-              family = binomial)
+model_glm <- glm(Survived ~ Sex + Age + Pclass + Embarked,
+                 data = ds_full,
+                 family = binomial)
+
 summary(model_glm)
 # Embarked seems in fact irrelevant, I remove it from the dataset
 ds_full[, Embarked := NULL]
+
 # split into training and test set again
 ds_train <- ds_full[train == TRUE]
 ds_train[, train := NULL]
@@ -84,13 +148,14 @@ ds_test[, train := NULL]
 remove(ds_full)
 # convert variable Survived to factor
 ds_train$Survived <- as.factor(ds_train$Survived)
+
 # remove PassengerId 
 ds_train[, PassengerId := NULL]
 ds_train
 ```
 
 
-# Review Imported Data Sets
+# Imported Data Sets
 
 ```{r}
 str(ds_train)
@@ -167,11 +232,11 @@ bwplot(Survived ~ Fare | Sex, ds_train)
 ## Scatter Plot
 
 ```{r}
-pairs(ds_train,
-      main = "Titanic - pairs(ds_train)",
-      pch = 21,
-      cex = 2,
-      bg = c("red", "green3")[unclass(ds_train$Survived)])
+# pairs(ds_train,
+#       main = "Titanic - pairs(ds_train)",
+#       pch = 21,
+#       cex = 2,
+#       bg = c("red", "green3")[unclass(ds_train$Survived)])
 ```
 
 
@@ -184,7 +249,7 @@ lattice::splom(ds_train,
 
 ```{r}
 library(GGally)
-ggpairs(data = ds_train, progress = FALSE, ggplot2::aes(colour=Survived))
+# ggpairs(data = ds_train, progress = FALSE, ggplot2::aes(colour=Survived))
 ```
 
 
@@ -218,10 +283,18 @@ prediction_glm_base <-
                 newdata = ds_train,
                 type = "response")
 
+# review prediction
+head(prediction_glm_base)
+
+# create confusion matrix
 conf_matrix_glm_base <-
         confusionMatrix(as.factor(ifelse(prediction_glm_base < 0.5, 0, 1)),
                         ds_train$Survived)
+
+# exctract Accuracy into variable
 accuracy_glm_base <- conf_matrix_glm_base$overall["Accuracy"]
+
+# review confusion matrix output
 conf_matrix_glm_base
 ```
 
@@ -252,6 +325,14 @@ conf_matrix_glm_caret_preproc
 ```
 
 
+## Replace unique new factor levels in Title as it causes an error if it was not present in the train set
+
+```{r}
+ds_test[Title == "Dona", Title := "Mrs"]
+ds_test[, table(Title)]
+```
+
+
 ## Random Forest
 
 ```{r}
@@ -270,6 +351,7 @@ model_rf
 plot(model_rf)
 ```
 
+Calculation of variable importance:
 ```{r}
 caret::varImp(model_rf)
 ```
@@ -294,10 +376,13 @@ conf_matrix_rf
 cl <- makePSOCKcluster(5)
 registerDoParallel(cl)
 
-
 #Setup parameters for optimisation
 params <-
         expand.grid(sigma = seq(0.05, 2, 0.05), C = seq(0.5, 2, 0.5))
+
+head(params)
+tail(params)
+
 #Train model with entire train data set
 model_svmr <- train(Survived ~ .,
                     method = "svmRadial",
@@ -336,7 +421,7 @@ submission <- data.frame(PassengerID = ds_test$PassengerId,  Survived = predicti
 ```
 
 ```{r}
-head(submission %>% head)
+head(submission)
 ```
 
 ```{r}
@@ -356,7 +441,9 @@ write.table(
 # Submission SVM
 ```{r}
 prediction_test_ds_svm <- predict(model_svmr, ds_test)
+
 submission_svm <- data.frame(PassengerID = ds_test$PassengerId,  Survived = prediction_test_ds_svm)
+
 write.table(
         submission_svm,
         file = "submission.csv",
